@@ -20,7 +20,7 @@ python3 revagg.py example.com
 
 # default ports (80,443,8080,8443) with 20 workers
 
-python3 revagg.py example.com
+python3 revagg.py example.com --ports 80,443,8080,8443
 
 # custom ports and workers
 
