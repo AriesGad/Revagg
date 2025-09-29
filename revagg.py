@@ -32,6 +32,7 @@ import traceback
 import argparse
 from colorama import init as colorama_init, Fore, Style
 import urllib3
+from urllib.parse import urlparse
 
 # disable insecure request warnings shown when verify=False
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -49,6 +50,12 @@ LIVE_FILE = "revagg_live.txt"
 HACKERTARGET_URL = "https://api.hackertarget.com/reverseiplookup/?q={ip}"
 VIEWDNS_URL = "https://viewdns.info/reverseip/?host={ip}&t=1"
 CRTSH_URL = "https://crt.sh/?q={query}&output=json"
+RAPIDDNS_URL = "https://rapiddns.io/sameip/{ip}"
+THREATCROWD_URL = "https://www.threatcrowd.org/searchApi/v2/ip/report/?ip={ip}"
+CERTSPOTTER_URL = "https://api.certspotter.com/v1/issuances?domain={domain}&include_subdomains=true&expand=dns_names"
+COMMONCRAWL_COLLINFO = "https://index.commoncrawl.org/collinfo.json"
+COMMONCRAWL_URL = "{index_url}?url=*.{domain}/&output=json&fl=url&limit=10000"  # limit to avoid too many
+WAYBACK_URL = "https://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&fl=original&collapse=urlkey&limit=10000"
 
 # concurrency default
 DEFAULT_WORKERS = 20
@@ -131,6 +138,48 @@ def query_viewdns(ip):
         dbg(f"viewdns error for {ip}: {e}")
     return results
 
+def query_rapiddns(ip):
+    results = set()
+    try:
+        url = RAPIDDNS_URL.format(ip=ip)
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, "html.parser")
+            table = soup.find("table", id="table")
+            if table:
+                rows = table.find_all("tr")
+                for row in rows[1:]:
+                    cols = row.find_all("td")
+                    if len(cols) >= 1:
+                        hostname = cols[0].get_text(strip=True)
+                        if hostname:
+                            results.add(hostname)
+            else:
+                dbg(f"rapiddns: table not found for {ip}")
+        else:
+            dbg(f"rapiddns returned status {r.status_code} for {ip}")
+    except Exception as e:
+        dbg(f"rapiddns error for {ip}: {e}")
+    return results
+
+def query_threatcrowd(ip):
+    results = set()
+    try:
+        url = THREATCROWD_URL.format(ip=ip)
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("response_code") == "1":
+                for res in data.get("resolutions", []):
+                    domain = res.get("domain")
+                    if domain:
+                        results.add(domain)
+        else:
+            dbg(f"threatcrowd returned status {r.status_code} for {ip}")
+    except Exception as e:
+        dbg(f"threatcrowd error for {ip}: {e}")
+    return results
+
 def query_crtsh_for_domain(domain):
     results = set()
     try:
@@ -153,6 +202,77 @@ def query_crtsh_for_domain(domain):
             dbg(f"crt.sh returned status {r.status_code} for {domain}")
     except Exception as e:
         dbg(f"crt.sh error for {domain}: {e}")
+    return results
+
+def query_certspotter_for_domain(domain):
+    results = set()
+    try:
+        url = CERTSPOTTER_URL.format(domain=domain)
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            for item in data:
+                dns_names = item.get("dns_names", [])
+                for name in dns_names:
+                    name = name.strip().rstrip(".")
+                    if name:
+                        results.add(name)
+        else:
+            dbg(f"certspotter returned status {r.status_code} for {domain}")
+    except Exception as e:
+        dbg(f"certspotter error for {domain}: {e}")
+    return results
+
+def get_latest_commoncrawl_index():
+    try:
+        r = requests.get(COMMONCRAWL_COLLINFO, headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                return data[0]["cdx_api"]  # latest
+    except Exception as e:
+        dbg(f"commoncrawl collinfo error: {e}")
+    return None
+
+def query_commoncrawl_for_domain(domain):
+    results = set()
+    index_url = get_latest_commoncrawl_index()
+    if not index_url:
+        return results
+    try:
+        url = COMMONCRAWL_URL.format(index_url=index_url, domain=domain)
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code == 200:
+            lines = r.text.splitlines()
+            for line in lines:
+                if line.strip():
+                    data = json.loads(line)
+                    if "url" in data:
+                        parsed = urlparse(data["url"])
+                        if parsed.hostname:
+                            results.add(parsed.hostname)
+        else:
+            dbg(f"commoncrawl returned status {r.status_code} for {domain}")
+    except Exception as e:
+        dbg(f"commoncrawl error for {domain}: {e}")
+    return results
+
+def query_wayback_for_domain(domain):
+    results = set()
+    try:
+        url = WAYBACK_URL.format(domain=domain)
+        r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            for item in data[1:]:  # skip header
+                if item:
+                    parsed = urlparse(item[0])
+                    if parsed.hostname:
+                        results.add(parsed.hostname)
+        else:
+            dbg(f"wayback returned status {r.status_code} for {domain}")
+    except Exception as e:
+        dbg(f"wayback error for {domain}: {e}")
     return results
 
 # ======== HTTP probe ========
@@ -341,6 +461,26 @@ def main():
             print("  viewdns: no results or rate-limited")
         time.sleep(SLEEP_BETWEEN_QUERIES)
 
+        print("  Querying rapiddns (scrape)...")
+        rd = query_rapiddns(ip)
+        if rd:
+            print(f"  rapiddns: {len(rd)} results")
+            all_candidates.update(rd)
+            sources.append(("rapiddns", ip, rd))
+        else:
+            print("  rapiddns: no results or rate-limited")
+        time.sleep(SLEEP_BETWEEN_QUERIES)
+
+        print("  Querying threatcrowd...")
+        tc = query_threatcrowd(ip)
+        if tc:
+            print(f"  threatcrowd: {len(tc)} results")
+            all_candidates.update(tc)
+            sources.append(("threatcrowd", ip, tc))
+        else:
+            print("  threatcrowd: no results or rate-limited")
+        time.sleep(SLEEP_BETWEEN_QUERIES)
+
     if domain:
         print("  Querying crt.sh for certificate transparency entries (may be large)...")
         crt = query_crtsh_for_domain(domain)
@@ -350,6 +490,36 @@ def main():
             sources.append(("crt.sh", domain, crt))
         else:
             print("  crt.sh: no results or rate-limited")
+        time.sleep(SLEEP_BETWEEN_QUERIES)
+
+        print("  Querying certspotter for certificate transparency entries...")
+        cs = query_certspotter_for_domain(domain)
+        if cs:
+            print(f"  certspotter: {len(cs)} results")
+            all_candidates.update(cs)
+            sources.append(("certspotter", domain, cs))
+        else:
+            print("  certspotter: no results or rate-limited")
+        time.sleep(SLEEP_BETWEEN_QUERIES)
+
+        print("  Querying commoncrawl for archived entries...")
+        cc = query_commoncrawl_for_domain(domain)
+        if cc:
+            print(f"  commoncrawl: {len(cc)} results")
+            all_candidates.update(cc)
+            sources.append(("commoncrawl", domain, cc))
+        else:
+            print("  commoncrawl: no results or rate-limited")
+        time.sleep(SLEEP_BETWEEN_QUERIES)
+
+        print("  Querying wayback archive for archived entries...")
+        wb = query_wayback_for_domain(domain)
+        if wb:
+            print(f"  wayback: {len(wb)} results")
+            all_candidates.update(wb)
+            sources.append(("wayback", domain, wb))
+        else:
+            print("  wayback: no results or rate-limited")
         time.sleep(SLEEP_BETWEEN_QUERIES)
 
     # Write candidates
